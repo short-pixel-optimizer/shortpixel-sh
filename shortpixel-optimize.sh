@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# shortpixel-optimize.sh v2.0
+# shortpixel-optimize.sh v3.0  — zero-dependency edition
 #
-# Batch-optimize images using the ShortPixel API with decentralized state
-# tracking (.splog), mirrored backups, and structured restore/purge workflows.
+# Batch-optimizes images using the ShortPixel API.
+# Requires: bash 4+, curl  (uses grep/sed/awk — standard on every Unix system)
 #
 # USAGE:
 #   ./shortpixel-optimize.sh [OPTIONS] [input_dir]
@@ -22,20 +22,18 @@
 #       --backup-dir DIR   Custom backup mirror directory
 #                          (default: <script_dir>/backups)
 #       --restore          Copy all backup files back to source; delete .splog files
-#       --purge-backups [N] Delete backup files older than N days that have a
-#                          .splog entry. Default: 30 days. Files with no .splog
-#                          entry are kept regardless of age.
+#       --purge-backups [N] Delete backup files older than N days (default: 30)
+#                          that also have a .splog entry
 #
 # PROCESSING OPTIONS:
 #   -j, --concurrency N    Parallel workers (default: 4)
 #   -w, --wait N           API wait seconds, 1-30 (default: 25)
-#       --force            Ignore existing .splog entries; re-optimize and
-#                          overwrite backup
+#       --force            Ignore existing .splog entries; re-optimize
 #
 # COMPRESSION OPTIONS:
 #   -l, --lossy N          0=lossless, 1=lossy (default), 2=glossy
 #       --keep-exif        Preserve EXIF metadata
-#       --no-cmyk2rgb      Disable CMYK→RGB conversion
+#       --no-cmyk2rgb      Disable CMYK to RGB conversion
 #
 # RESIZE OPTIONS:
 #       --resize MODE      0=none (default), 1=outer box, 3=inner box, 4=smart crop
@@ -52,56 +50,41 @@
 #
 # EXIT CODES:
 #   0   Success / normal operation
-#   1   API / Network error (fatal: unreachable endpoint or auth failure)
-#   2   Permissions error (cannot write output or backup dir)
-#   3   Configuration error (missing key, bad arguments, missing dependency)
+#   1   API / Network error (fatal)
+#   2   Permissions error
+#   3   Configuration / dependency error
 #
 # .env FILE (loaded from the script's directory):
 #   API_KEY      Your ShortPixel API key
 #   BACKUP_DIR   Path to backup mirror directory (default: <script_dir>/backups)
+#   EMAIL        Email address for analytics reports after each run (optional)
+#   MAIL_CMD     Mail command to use: "mail" or "sendmail" (auto-detected)
 #   EXCLUDE_EXT  Comma-separated, case-sensitive extensions to skip
-#                Example: EXCLUDE_EXT=JPG,PNG   → skips file.JPG, file.PNG
-#                         but NOT file.jpg or file.png
+#                Example: EXCLUDE_EXT=JPG,PNG
 #
 # EXAMPLES:
-#   # Optimize current directory, save to ./optimized/
 #   ./shortpixel-optimize.sh -k MY_KEY
-#
-#   # Overwrite originals, 8 workers, glossy compression
 #   ./shortpixel-optimize.sh -k MY_KEY --overwrite -j 8 -l 2 ./images
-#
-#   # Restore all files from backup (undo optimizations)
 #   ./shortpixel-optimize.sh --restore ./images
-#
-#   # Purge backups older than 14 days that have .splog entries
 #   ./shortpixel-optimize.sh --purge-backups 14 ./images
-#
-#   # Re-optimize everything, ignoring .splog
 #   ./shortpixel-optimize.sh -k MY_KEY --force --overwrite ./images
 #
-# DEPENDENCIES: curl, jq (auto-installed via apt if missing)
+# DEPENDENCIES: curl (uses only standard POSIX tools: grep, sed, awk, md5sum)
 # ==============================================================================
 
 set -euo pipefail
 
-# Resolve the script's own directory (for .env and restore_audit.log)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ==============================================================================
-# SECTION 1: LOAD .env AND SET CONFIGURATION DEFAULTS
+# SECTION 1: CONFIGURATION DEFAULTS
 # ==============================================================================
-
-# Load .env from the script directory (set -a exports all variables)
-if [[ -f "${SCRIPT_DIR}/.env" ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "${SCRIPT_DIR}/.env"
-    set +a
-fi
 
 readonly API_ENDPOINT="https://api.shortpixel.com/v2/post-reducer.php"
 
-API_KEY="${API_KEY:-}"
+API_KEY=""
+EMAIL=""
+MAIL_CMD=""
 LOSSY=1
 API_WAIT=25
 RESIZE=0
@@ -124,21 +107,20 @@ DO_RESTORE=false
 DO_PURGE=false
 PURGE_DAYS=30
 
-BACKUP_DIR="${BACKUP_DIR:-${SCRIPT_DIR}/backups}"
-EXCLUDE_EXT="${EXCLUDE_EXT:-}"
+BACKUP_DIR="${SCRIPT_DIR}/backups"
+EXCLUDE_EXT=""
 
-# Runtime state (populated later)
+# Runtime state
 PROGRESS_DIR=""
 SEMAPHORE=""
 TOTAL_FILES=0
 WORKER_TMP_FILE=""
 DASHBOARD_ENABLED=false
 
-# Global analytics arrays — must be at global scope so show_dashboard() can read them
 declare -a SKIPPED_FOLDERS=()
 declare -A DIR_CHECKED=()
 
-# Non-interactive detection (for CRON: bypass confirmation prompts)
+# Non-interactive detection (CRON: bypass prompts)
 IS_INTERACTIVE=true
 [[ -t 0 ]] || IS_INTERACTIVE=false
 
@@ -160,7 +142,7 @@ else
 fi
 
 # ==============================================================================
-# SECTION 3: LOGGING
+# SECTION 3: LOGGING HELPERS
 # ==============================================================================
 
 log_info()    { echo "${COLOR_BLUE}[INFO]${COLOR_RESET}  $*" >&2; }
@@ -186,13 +168,11 @@ get_file_size() {
         || echo "0"
 }
 
-# Returns the extension with its original case (for case-sensitive exclusion checks)
 get_file_extension() {
     local f="${1##*/}"
     echo "${f##*.}"
 }
 
-# Returns the lowercase extension (for image type detection)
 get_file_extension_lower() {
     local ext
     ext=$(get_file_extension "$1")
@@ -200,18 +180,15 @@ get_file_extension_lower() {
 }
 
 get_md5() {
-    local file="$1"
     if command -v md5sum &>/dev/null; then
-        md5sum "$file" | cut -d' ' -f1
+        md5sum "$1" | cut -d' ' -f1
     elif command -v md5 &>/dev/null; then
-        md5 -q "$file"
+        md5 -q "$1"
     else
         echo "00000000000000000000000000000000"
     fi
 }
 
-# Convert bytes to human-readable string (B / KB / MB / GB)
-# LC_NUMERIC=C ensures "." as decimal separator regardless of system locale
 format_bytes() {
     local bytes="${1:-0}"
     if (( bytes >= 1073741824 )); then
@@ -225,195 +202,246 @@ format_bytes() {
     fi
 }
 
-# Sum a file of zero-padded 20-digit integers, one per line
 sum_size_file() {
-    local f="$1"
-    [[ -f "$f" ]] || { echo 0; return; }
-    awk '{s += $1} END {printf "%d", s+0}' "$f"
+    [[ -f "$1" ]] || { echo 0; return; }
+    awk '{s += $1} END {printf "%d", s+0}' "$1"
 }
 
 # ==============================================================================
-# SECTION 6: EXCLUSION CHECK (case-sensitive extension match)
+# SECTION 6: JSON PARSING  (no jq required)
+#
+# All parsers expect a compact single-line JSON string.
+# _json_first() normalises array-or-object input to a single-object string.
+# ==============================================================================
+
+# If JSON starts with '[', extract the first {...} object; otherwise return as-is.
+# Also collapses newlines so callers don't have to worry about multi-line input.
+_json_first() {
+    local json
+    json=$(printf '%s' "$1" | tr -d '\n\r')
+    if [[ "${json:0:1}" != "[" ]]; then
+        printf '%s' "$json"
+        return
+    fi
+    printf '%s' "$json" | awk '
+    BEGIN { depth=0; start=0; done=0 }
+    {
+        for (i=1; i<=length($0); i++) {
+            c = substr($0, i, 1)
+            if (c == "{") { if (!depth) start=i; depth++ }
+            if (c == "}" && depth > 0) {
+                depth--
+                if (!depth) { print substr($0, start, i-start+1); done=1; exit }
+            }
+        }
+    }
+    END { if (!done) print $0 }
+    '
+}
+
+# Extract Status.Code from a (single-object) JSON string.
+# Matches "Status":{"Code":"X",...} using grep's -o flag.
+_json_status_code() {
+    printf '%s' "$1" \
+        | grep -o '"Status"[[:space:]]*:[[:space:]]*{[^}]*}' \
+        | grep -o '"Code"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | head -1 \
+        | sed 's/.*"Code"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/'
+}
+
+# Extract Status.Message
+_json_status_message() {
+    printf '%s' "$1" \
+        | grep -o '"Status"[[:space:]]*:[[:space:]]*{[^}]*}' \
+        | grep -o '"Message"[[:space:]]*:[[:space:]]*"[^"]*"' \
+        | head -1 \
+        | sed 's/.*"Message"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/'
+}
+
+# Extract a top-level string field:  "Key":"Value"  ->  Value
+_json_str() {
+    local json="$1" key="$2"
+    printf '%s' "$json" \
+        | grep -o "\"${key}\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" \
+        | head -1 \
+        | sed "s/^\"[^\"]*\"[[:space:]]*:[[:space:]]*\"//;s/\"$//"
+}
+
+# Extract a top-level numeric field:  "Key":12345  ->  12345
+_json_num() {
+    local json="$1" key="$2"
+    printf '%s' "$json" \
+        | grep -o "\"${key}\"[[:space:]]*:[[:space:]]*-\?[0-9][0-9]*" \
+        | head -1 \
+        | sed 's/.*:[[:space:]]*//'
+}
+
+# ==============================================================================
+# SECTION 7: EXCLUSION CHECK  (case-sensitive extension match)
 # ==============================================================================
 
 is_excluded() {
     [[ -z "$EXCLUDE_EXT" ]] && return 1
-    local actual_ext
+    local actual_ext e
     actual_ext=$(get_file_extension "$1")
-    local e
     IFS=',' read -ra _excl_arr <<< "$EXCLUDE_EXT"
     for e in "${_excl_arr[@]}"; do
-        e="${e// /}"   # trim spaces
+        e="${e// /}"
         [[ "$actual_ext" == "$e" ]] && return 0
     done
     return 1
 }
 
 # ==============================================================================
-# SECTION 7: .splog MANAGEMENT
+# SECTION 8: .splog MANAGEMENT
 #
 # One .splog file per directory, alongside the images it tracks.
 # Format per line (pipe-delimited):
 #   md5|filename|orig_size|opt_size|savings_pct|comp_type|epoch_timestamp
 # ==============================================================================
 
-# Remove .splog entries for files that no longer exist in the directory
 splog_prune() {
-    local dir="$1"
-    local splog="${dir}/.splog"
+    local dir="$1" splog tmp
+    splog="${dir}/.splog"
     [[ -f "$splog" ]] || return 0
-
-    local tmp
     tmp=$(mktemp)
-    while IFS='|' read -r md5 filename orig opt savings comp ts; do
+    while IFS='|' read -r md5 filename rest; do
         [[ -z "$filename" ]] && continue
-        if [[ -f "${dir}/${filename}" ]]; then
-            printf '%s|%s|%s|%s|%s|%s|%s\n' \
-                "$md5" "$filename" "$orig" "$opt" "$savings" "$comp" "$ts"
-        fi
+        [[ -f "${dir}/${filename}" ]] && printf '%s|%s|%s\n' "$md5" "$filename" "$rest"
     done < "$splog" > "$tmp"
     mv "$tmp" "$splog"
 }
 
-# Returns 0 if filename has an entry in the directory's .splog
 splog_has_entry() {
-    local dir="$1" filename="$2"
-    local splog="${dir}/.splog"
+    local splog="${1}/.splog"
     [[ -f "$splog" ]] || return 1
-    awk -F'|' -v f="$filename" '$2==f {found=1; exit} END {exit !found}' "$splog"
+    awk -F'|' -v f="$2" '$2==f {found=1; exit} END {exit !found}' "$splog"
 }
 
-# Write (or update) an entry in the directory's .splog; concurrent-safe via flock
 splog_write_entry() {
     local dir="$1" md5="$2" filename="$3"
     local orig_size="$4" opt_size="$5" savings="$6" comp_type="$7"
-    local timestamp
+    local timestamp splog lock_key lock_file
     timestamp=$(date +%s)
-    local splog="${dir}/.splog"
-    # Derive a per-directory lock path under PROGRESS_DIR
-    local lock_key
-    lock_key=$(printf '%s' "$dir" | md5sum 2>/dev/null | cut -d' ' -f1 || printf '%s' "$dir" | cksum | cut -d' ' -f1)
-    local lock_file="${PROGRESS_DIR}/splog_${lock_key}.lock"
-
+    splog="${dir}/.splog"
+    lock_key=$(printf '%s' "$dir" | md5sum 2>/dev/null | cut -d' ' -f1 \
+               || printf '%s' "$dir" | cksum | cut -d' ' -f1)
+    lock_file="${PROGRESS_DIR}/splog_${lock_key}.lock"
     (
         flock -x 9
         local tmp
         tmp=$(mktemp)
-        if [[ -f "$splog" ]]; then
-            awk -F'|' -v f="$filename" '$2!=f {print}' "$splog" > "$tmp" 2>/dev/null || true
-        fi
+        [[ -f "$splog" ]] && awk -F'|' -v f="$filename" '$2!=f {print}' "$splog" > "$tmp" 2>/dev/null || true
         printf '%s|%s|%s|%s|%s|%s|%s\n' \
-            "$md5" "$filename" "$orig_size" "$opt_size" "$savings" "$comp_type" "$timestamp" \
-            >> "$tmp"
+            "$md5" "$filename" "$orig_size" "$opt_size" "$savings" "$comp_type" "$timestamp" >> "$tmp"
         mv "$tmp" "$splog"
     ) 9>"$lock_file"
 }
 
 # ==============================================================================
-# SECTION 8: BACKUP MANAGEMENT
+# SECTION 9: BACKUP MANAGEMENT
 # ==============================================================================
 
-# Derive the backup mirror path for a given source file
 get_backup_path() {
-    local source_file="$1"
-    local rel_path="${source_file#${INPUT_DIR}/}"
-    echo "${BACKUP_DIR}/${rel_path}"
+    echo "${BACKUP_DIR}/${1#${INPUT_DIR}/}"
 }
 
-# Copy a source file to its backup mirror location
 backup_file() {
-    local source_file="$1"
     local backup_path
-    backup_path=$(get_backup_path "$source_file")
+    backup_path=$(get_backup_path "$1")
     mkdir -p "$(dirname "$backup_path")"
-    if ! cp "$source_file" "$backup_path"; then
-        log_error "Backup failed: $source_file → $backup_path"
-        return 1
-    fi
-    return 0
+    cp "$1" "$backup_path" || { log_error "Backup failed: $1 → $backup_path"; return 1; }
 }
 
-# Verify a backup file exists and is non-empty
 verify_backup() {
-    local backup_path="$1"
-    if [[ ! -f "$backup_path" ]]; then
-        log_error "Backup missing: $backup_path"
-        return 1
-    fi
     local sz
-    sz=$(get_file_size "$backup_path")
-    if (( sz == 0 )); then
-        log_error "Backup is empty (0 bytes): $backup_path"
-        return 1
-    fi
-    return 0
+    [[ -f "$1" ]] || { log_error "Backup missing: $1";              return 1; }
+    sz=$(get_file_size "$1")
+    (( sz > 0 ))  || { log_error "Backup is empty (0 bytes): $1";   return 1; }
 }
 
 # ==============================================================================
-# SECTION 9: PROGRESS TRACKING
+# SECTION 10: PROGRESS TRACKING
 # ==============================================================================
 
-# Atomically increment a file-based counter (POSIX O_APPEND guarantee)
-increment_counter() {
-    printf '\n' >> "$1"
-}
+increment_counter() { printf '\n' >> "$1"; }
 
 show_progress() {
-    local total="$1" progress_dir="$2"
-    local s=0 e=0 sk=0 ex=0
-    [[ -f "$progress_dir/success"  ]] && s=$(wc -l < "$progress_dir/success")
-    [[ -f "$progress_dir/error"    ]] && e=$(wc -l < "$progress_dir/error")
-    [[ -f "$progress_dir/skipped"  ]] && sk=$(wc -l < "$progress_dir/skipped")
-    [[ -f "$progress_dir/excluded" ]] && ex=$(wc -l < "$progress_dir/excluded")
-    local done=$(( s + e ))
-    local rem=$(( total - done - sk - ex ))
+    local total="$1" pd="$2" s=0 e=0 sk=0 ex=0 done rem
+    [[ -f "$pd/success"  ]] && s=$( wc -l < "$pd/success")
+    [[ -f "$pd/error"    ]] && e=$( wc -l < "$pd/error")
+    [[ -f "$pd/skipped"  ]] && sk=$(wc -l < "$pd/skipped")
+    [[ -f "$pd/excluded" ]] && ex=$(wc -l < "$pd/excluded")
+    done=$(( s + e ))
+    rem=$(( total - done - sk - ex ))
     (( rem < 0 )) && rem=0
     printf '\r%s[%d/%d]%s  OK:%s%d%s  Err:%s%d%s  Skip:%d  Excl:%d  Rem:%d   ' \
         "$COLOR_BOLD" "$done" "$total" "$COLOR_RESET" \
-        "$COLOR_GREEN" "$s" "$COLOR_RESET" \
-        "$COLOR_RED"   "$e" "$COLOR_RESET" \
+        "$COLOR_GREEN" "$s"   "$COLOR_RESET" \
+        "$COLOR_RED"   "$e"   "$COLOR_RESET" \
         "$sk" "$ex" "$rem" >&2
 }
 
 # ==============================================================================
-# SECTION 10: API INTERACTION
+# SECTION 11: EMAIL REPORT
+# ==============================================================================
+
+_detect_mail_cmd() {
+    if   command -v mail     &>/dev/null; then echo "mail"
+    elif command -v sendmail &>/dev/null; then echo "sendmail"
+    else echo ""
+    fi
+}
+
+# send_email_report SUBJECT BODY
+send_email_report() {
+    [[ -z "${EMAIL:-}" ]] && return 0
+    [[ -z "${MAIL_CMD:-}" ]] && MAIL_CMD=$(_detect_mail_cmd)
+    if [[ -z "$MAIL_CMD" ]]; then
+        log_warn "No mail command found; email report skipped."
+        return 0
+    fi
+    local subject="$1" body="$2"
+    case "$MAIL_CMD" in
+        mail)
+            printf '%s' "$body" | mail -s "$subject" "$EMAIL" 2>/dev/null \
+                && log_success "Report emailed to $EMAIL" \
+                || log_warn "Failed to send email report."
+            ;;
+        sendmail)
+            { printf 'To: %s\nSubject: %s\nContent-Type: text/plain; charset=UTF-8\n\n%s' \
+                "$EMAIL" "$subject" "$body"; } \
+                | sendmail -t 2>/dev/null \
+                && log_success "Report emailed to $EMAIL" \
+                || log_warn "Failed to send email report."
+            ;;
+    esac
+}
+
+# ==============================================================================
+# SECTION 12: API INTERACTION
 # ==============================================================================
 
 download_file() {
-    local url="$1" dest_path="$2"
-    mkdir -p "$(dirname "$dest_path")"
-    curl --fail --silent --show-error --location --output "$dest_path" "$url"
-}
-
-parse_api_response() {
-    local json="$1" query="$2"
-    echo "$json" \
-        | jq -r "if type == \"array\" then . else [.] end | ${query}" 2>/dev/null \
-        || echo "parse_error"
+    mkdir -p "$(dirname "$2")"
+    curl --fail --silent --show-error --location --output "$2" "$1"
 }
 
 optimize_single_file() {
     local input_file="$1"
-    local filename file_dir
-    filename="$(basename "$input_file")"
-    file_dir="$(dirname "$input_file")"
+    local filename file_dir output_file comp_type original_size backup_path md5
+    local extension curl_max_time api_response curl_exit
+    local first_obj status_code status_message original_url
+    local download_url optimized_size opt_size_int savings_pct tmp_dl
 
-    # Determine output path.
-    # Default (no --output-dir): place optimized file in an "optimized/" subfolder
-    # inside the same directory as the source file, e.g.:
-    #   source:    /images/subdir/photo.jpg
-    #   optimized: /images/subdir/optimized/photo.jpg
-    # With --output-dir: place all files flat inside OUTPUT_DIR (no mirroring).
-    local output_file
-    if [[ "$OVERWRITE" == "true" ]]; then
-        output_file="$input_file"
-    elif [[ -n "$OUTPUT_DIR" ]]; then
-        output_file="${OUTPUT_DIR}/${filename}"
-    else
-        output_file="${file_dir}/optimized/${filename}"
+    filename="$(basename  "$input_file")"
+    file_dir="$(dirname   "$input_file")"
+
+    if   [[ "$OVERWRITE" == "true" ]]; then output_file="$input_file"
+    elif [[ -n "$OUTPUT_DIR"       ]]; then output_file="${OUTPUT_DIR}/${filename}"
+    else                                    output_file="${file_dir}/optimized/${filename}"
     fi
 
-    local comp_type
     case "$LOSSY" in
         0) comp_type="lossless" ;;
         1) comp_type="lossy"    ;;
@@ -421,39 +449,20 @@ optimize_single_file() {
         *) comp_type="unknown"  ;;
     esac
 
-    local original_size
     original_size=$(get_file_size "$input_file")
-
-    # ------------------------------------------------------------------
-    # INTEGRITY: back up the original BEFORE any API call.
-    # If backup fails or is empty, abort this file (leave original intact).
-    # ------------------------------------------------------------------
-    local backup_path
     backup_path=$(get_backup_path "$input_file")
 
-    if ! backup_file "$input_file"; then
+    if ! backup_file "$input_file" || ! verify_backup "$backup_path"; then
         increment_counter "$PROGRESS_DIR/error"
         show_progress "$TOTAL_FILES" "$PROGRESS_DIR"
         return 1
     fi
 
-    if ! verify_backup "$backup_path"; then
-        increment_counter "$PROGRESS_DIR/error"
-        show_progress "$TOTAL_FILES" "$PROGRESS_DIR"
-        return 1
-    fi
-
-    # Compute MD5 of the original (from the backup, since overwrite replaces input_file)
-    local md5
     md5=$(get_md5 "$backup_path")
 
-    # ------------------------------------------------------------------
-    # Create a temp file with a safe (space-free) path for curl upload
-    # ------------------------------------------------------------------
-    local extension
+    # Temp file with safe (space-free) path for curl
     extension=$(get_file_extension_lower "$filename")
-    WORKER_TMP_FILE=$(mktemp --suffix=".${extension}")
-
+    WORKER_TMP_FILE=$(mktemp "/tmp/sp_upload_XXXXXX.${extension}")
     if ! cp "$input_file" "$WORKER_TMP_FILE"; then
         log_error "Cannot create temp upload file for: $filename"
         increment_counter "$PROGRESS_DIR/error"
@@ -461,15 +470,11 @@ optimize_single_file() {
         return 1
     fi
 
-    # ------------------------------------------------------------------
-    # Build the API request
-    # ------------------------------------------------------------------
-    # max-time: at least 60s to cover upload + API_WAIT + download latency
-    local curl_max_time=$(( API_WAIT + 60 ))
+    curl_max_time=$(( API_WAIT + 60 ))
     (( curl_max_time < 60 )) && curl_max_time=60
+
     local -a curl_args=(
-        --silent --show-error
-        --max-time "$curl_max_time"
+        --silent --show-error --max-time "$curl_max_time"
         -F "key=${API_KEY}"
         -F "lossy=${LOSSY}"
         -F "wait=${API_WAIT}"
@@ -486,32 +491,26 @@ optimize_single_file() {
     [[ -n "$UPSCALE"       ]] && curl_args+=(-F "upscale=${UPSCALE}")
 
     log_info "Uploading: $filename"
+    api_response=$(curl "${curl_args[@]}" "$API_ENDPOINT" 2>&1) || curl_exit=$?
+    curl_exit="${curl_exit:-0}"
 
-    local api_response curl_exit
-    api_response=$(curl "${curl_args[@]}" "$API_ENDPOINT" 2>&1)
-    curl_exit=$?
     if (( curl_exit != 0 )); then
         if (( curl_exit == 28 )); then
-            log_error "Upload timed out (no response from API) for: $filename"
-            log_error "  Hint: key may be domain-restricted or account has no credits."
-            log_error "  Check your API key settings at shortpixel.com"
+            log_error "Upload timed out for: $filename (key may be domain-restricted or no credits)"
         else
-            log_error "Upload failed (curl exit $curl_exit) for: $filename — $api_response"
+            log_error "Upload failed (curl exit $curl_exit) for: $filename"
         fi
         increment_counter "$PROGRESS_DIR/error"
         show_progress "$TOTAL_FILES" "$PROGRESS_DIR"
         return 1
     fi
 
-    # ------------------------------------------------------------------
-    # Parse initial response
-    # ------------------------------------------------------------------
-    local status_code status_message original_url
-    status_code=$(parse_api_response "$api_response" '.[0].Status.Code // "parse_error"')
-    status_message=$(parse_api_response "$api_response" '.[0].Status.Message // "unknown"')
-    original_url=$(parse_api_response "$api_response" '.[0].OriginalURL // ""')
+    first_obj=$(_json_first "$api_response")
+    status_code=$(_json_status_code "$first_obj")
+    status_message=$(_json_status_message "$first_obj")
+    original_url=$(_json_str "$first_obj" "OriginalURL")
 
-    if [[ "$status_code" == "parse_error" ]]; then
+    if [[ -z "$status_code" ]]; then
         log_error "Could not parse API response for: $filename"
         log_error "Raw: ${api_response:0:300}"
         increment_counter "$PROGRESS_DIR/error"
@@ -519,9 +518,7 @@ optimize_single_file() {
         return 1
     fi
 
-    # ------------------------------------------------------------------
-    # Polling loop (status "1" = still processing)
-    # ------------------------------------------------------------------
+    # Polling loop  (status "1" = processing)
     local poll_count=0
     while [[ "$status_code" == "1" ]]; do
         if (( poll_count >= MAX_POLL_RETRIES )); then
@@ -532,59 +529,48 @@ optimize_single_file() {
         fi
         log_info "  '$filename' pending (poll $((poll_count+1))/$MAX_POLL_RETRIES, ${POLL_SLEEP_SECONDS}s)..."
         sleep "$POLL_SLEEP_SECONDS"
-        poll_count=$(( poll_count + 1 ))
+        (( poll_count++ )) || true
 
-        if ! api_response=$(curl --silent --show-error \
-                --max-time "$curl_max_time" \
-                -F "key=${API_KEY}" \
-                -F "wait=${API_WAIT}" \
-                -F "file_urls[]=${original_url}" \
-                "$API_ENDPOINT" 2>&1); then
-            log_error "Poll request failed: $filename"
-            increment_counter "$PROGRESS_DIR/error"
-            show_progress "$TOTAL_FILES" "$PROGRESS_DIR"
-            return 1
-        fi
+        api_response=$(curl --silent --show-error \
+            --max-time "$curl_max_time" \
+            -F "key=${API_KEY}" \
+            -F "wait=${API_WAIT}" \
+            -F "file_urls[]=${original_url}" \
+            "$API_ENDPOINT" 2>&1) || {
+                log_error "Poll request failed: $filename"
+                increment_counter "$PROGRESS_DIR/error"
+                show_progress "$TOTAL_FILES" "$PROGRESS_DIR"
+                return 1
+            }
 
-        status_code=$(parse_api_response "$api_response" '.[0].Status.Code // "parse_error"')
-        status_message=$(parse_api_response "$api_response" '.[0].Status.Message // "unknown"')
+        first_obj=$(_json_first "$api_response")
+        status_code=$(_json_status_code "$first_obj")
+        status_message=$(_json_status_message "$first_obj")
     done
 
-    # ------------------------------------------------------------------
-    # Handle API errors (any non-"2" status)
-    # ------------------------------------------------------------------
     if [[ "$status_code" != "2" ]]; then
-        log_error "API error '$filename': [Code $status_code] $status_message"
+        log_error "API error for '$filename': [Code $status_code] $status_message"
         increment_counter "$PROGRESS_DIR/error"
         show_progress "$TOTAL_FILES" "$PROGRESS_DIR"
         return 1
     fi
 
-    # ------------------------------------------------------------------
-    # Extract download URL
-    # ------------------------------------------------------------------
-    local download_url optimized_size
     if [[ "$LOSSY" == "0" ]]; then
-        download_url=$(parse_api_response "$api_response" '.[0].LosslessURL // ""')
-        optimized_size=$(parse_api_response "$api_response" '.[0].LoselessSize // "0"')
+        download_url=$(_json_str "$first_obj" "LosslessURL")
+        optimized_size=$(_json_num "$first_obj" "LoselessSize")
     else
-        download_url=$(parse_api_response "$api_response" '.[0].LossyURL // ""')
-        optimized_size=$(parse_api_response "$api_response" '.[0].LossySize // "0"')
+        download_url=$(_json_str "$first_obj" "LossyURL")
+        optimized_size=$(_json_num "$first_obj" "LossySize")
     fi
 
     if [[ -z "$download_url" || "$download_url" == "null" ]]; then
-        log_error "No download URL for: $filename"
+        log_error "No download URL in API response for: $filename"
         increment_counter "$PROGRESS_DIR/error"
         show_progress "$TOTAL_FILES" "$PROGRESS_DIR"
         return 1
     fi
 
-    # ------------------------------------------------------------------
-    # Download to a temp file, then atomically move to destination
-    # ------------------------------------------------------------------
-    local tmp_dl
-    tmp_dl=$(mktemp --suffix=".${extension}")
-
+    tmp_dl=$(mktemp "/tmp/sp_dl_XXXXXX.${extension}")
     if ! download_file "$download_url" "$tmp_dl"; then
         rm -f "$tmp_dl"
         increment_counter "$PROGRESS_DIR/error"
@@ -595,33 +581,25 @@ optimize_single_file() {
     mkdir -p "$(dirname "$output_file")"
     mv "$tmp_dl" "$output_file"
 
-    # ------------------------------------------------------------------
-    # Calculate savings percentage (integer math, 2 decimal places)
-    # ------------------------------------------------------------------
-    local savings_pct="0.00"
-    if (( original_size > 0 && optimized_size > 0 )); then
-        local si=$(( (original_size - optimized_size) * 10000 / original_size ))
+    opt_size_int="${optimized_size:-0}"
+    savings_pct="0.00"
+    if (( original_size > 0 && opt_size_int > 0 )); then
+        local si=$(( (original_size - opt_size_int) * 10000 / original_size ))
         savings_pct=$(printf '%d.%02d' $(( si / 100 )) $(( si % 100 )))
     fi
 
-    # ------------------------------------------------------------------
-    # Write .splog entry and update counters
-    # ------------------------------------------------------------------
     splog_write_entry "$file_dir" "$md5" "$filename" \
-        "$original_size" "$optimized_size" "$savings_pct" "$comp_type"
+        "$original_size" "$opt_size_int" "$savings_pct" "$comp_type"
 
-    # Record sizes for the analytics dashboard
     printf '%020d\n' "$original_size"  >> "$PROGRESS_DIR/orig_bytes"
-    printf '%020d\n' "$optimized_size" >> "$PROGRESS_DIR/opt_bytes"
+    printf '%020d\n' "$opt_size_int"   >> "$PROGRESS_DIR/opt_bytes"
 
     increment_counter "$PROGRESS_DIR/success"
     show_progress "$TOTAL_FILES" "$PROGRESS_DIR"
-
-    log_success "$filename: $(format_bytes "$original_size") → $(format_bytes "$optimized_size") (${savings_pct}% saved)"
+    log_success "$filename: $(format_bytes "$original_size") → $(format_bytes "$opt_size_int") (${savings_pct}% saved)"
     return 0
 }
 
-# Thin wrapper: guarantees semaphore token is returned and temp files cleaned up
 process_file() {
     local input_file="$1"
     trap '[[ -n "${WORKER_TMP_FILE:-}" ]] && rm -f "$WORKER_TMP_FILE"; echo >&3' EXIT
@@ -629,67 +607,54 @@ process_file() {
 }
 
 # ==============================================================================
-# SECTION 11: ANALYTICS DASHBOARD
+# SECTION 13: ANALYTICS DASHBOARD
 # ==============================================================================
 
 show_dashboard() {
     [[ "$DASHBOARD_ENABLED" == "true" ]] || return 0
 
     local s=0 e=0 sk=0 ex=0
-    [[ -f "$PROGRESS_DIR/success"  ]] && s=$(wc -l  < "$PROGRESS_DIR/success"  | tr -d ' ')
-    [[ -f "$PROGRESS_DIR/error"    ]] && e=$(wc -l  < "$PROGRESS_DIR/error"    | tr -d ' ')
+    [[ -f "$PROGRESS_DIR/success"  ]] && s=$( wc -l < "$PROGRESS_DIR/success"  | tr -d ' ')
+    [[ -f "$PROGRESS_DIR/error"    ]] && e=$( wc -l < "$PROGRESS_DIR/error"    | tr -d ' ')
     [[ -f "$PROGRESS_DIR/skipped"  ]] && sk=$(wc -l < "$PROGRESS_DIR/skipped"  | tr -d ' ')
     [[ -f "$PROGRESS_DIR/excluded" ]] && ex=$(wc -l < "$PROGRESS_DIR/excluded" | tr -d ' ')
 
-    # Byte sums — all kept as integers
-    local sum_orig_success sum_opt_success sum_all_dispatched sum_excl sum_skip
-    sum_orig_success=$(sum_size_file "$PROGRESS_DIR/orig_bytes")
-    sum_opt_success=$(sum_size_file  "$PROGRESS_DIR/opt_bytes")
-    sum_all_dispatched=$(sum_size_file "$PROGRESS_DIR/all_orig_bytes")
+    local sum_orig sum_opt sum_disp sum_excl sum_skip
+    sum_orig=$(sum_size_file "$PROGRESS_DIR/orig_bytes")
+    sum_opt=$( sum_size_file "$PROGRESS_DIR/opt_bytes")
+    sum_disp=$(sum_size_file "$PROGRESS_DIR/all_orig_bytes")
     sum_excl=$(sum_size_file "$PROGRESS_DIR/excl_sizes")
     sum_skip=$(sum_size_file "$PROGRESS_DIR/skip_sizes")
 
-    # total_orig_all  = all source files (dispatched + excluded + skipped)
-    local total_orig_all=$(( sum_all_dispatched + sum_excl + sum_skip ))
-
-    # current_source = optimized sizes for successes + original sizes for everything else
-    # savings        = what the successes actually saved
-    local current_source=$(( sum_opt_success + total_orig_all - sum_orig_success ))
-    local savings=$(( sum_orig_success - sum_opt_success ))
+    local total_orig=$(( sum_disp + sum_excl + sum_skip ))
+    local current_source=$(( sum_opt + total_orig - sum_orig ))
+    local savings=$(( sum_orig - sum_opt ))
     (( savings < 0 )) && savings=0
 
     local savings_pct="0.00"
-    if (( total_orig_all > 0 )); then
-        local sp_int=$(( savings * 10000 / total_orig_all ))
+    if (( total_orig > 0 )); then
+        local sp_int=$(( savings * 10000 / total_orig ))
         savings_pct=$(printf '%d.%02d' $(( sp_int / 100 )) $(( sp_int % 100 )))
     fi
 
-    # Backup folder size (excluding .splog files)
     local backup_size=0
     if [[ -d "$BACKUP_DIR" ]]; then
         while IFS= read -r -d '' f; do
-            local fsz
-            fsz=$(get_file_size "$f")
+            local fsz; fsz=$(get_file_size "$f")
             (( backup_size += fsz )) || true
         done < <(find "$BACKUP_DIR" -type f ! -name ".splog" -print0 2>/dev/null)
     fi
     local total_footprint=$(( current_source + backup_size ))
 
-    local W=54  # inner width of dashboard box
-    local sep
-    sep=$(printf '═%.0s' $(seq 1 $W))
+    # ── Terminal (box-drawing) version ─────────────────────────────────────
+    local W=54
+    local sep; sep=$(printf '═%.0s' $(seq 1 $W))
 
-    _drow() {
-        # Print a line inside the box, padded to inner width W
-        printf "${COLOR_BOLD}${COLOR_CYAN}║${COLOR_RESET} %-${W}s ${COLOR_BOLD}${COLOR_CYAN}║${COLOR_RESET}\n" "$1" >&2
-    }
-    _dhdr() {
-        printf "${COLOR_BOLD}${COLOR_CYAN}╠%s╣${COLOR_RESET}\n" "$sep" >&2
-    }
+    _drow() { printf "${COLOR_BOLD}${COLOR_CYAN}║${COLOR_RESET} %-${W}s ${COLOR_BOLD}${COLOR_CYAN}║${COLOR_RESET}\n" "$1" >&2; }
+    _dhdr() { printf "${COLOR_BOLD}${COLOR_CYAN}╠%s╣${COLOR_RESET}\n" "$sep" >&2; }
 
     echo >&2
     printf "${COLOR_BOLD}${COLOR_CYAN}╔%s╗${COLOR_RESET}\n" "$sep" >&2
-    # Header: plain text centred (no ANSI codes inside _drow's padding calc)
     local _title="  SHORTPIXEL ANALYTICS DASHBOARD  "
     local _pad=$(( (W - ${#_title}) / 2 ))
     printf "${COLOR_BOLD}${COLOR_CYAN}║${COLOR_RESET}%*s${COLOR_BOLD}%s${COLOR_RESET}%*s${COLOR_BOLD}${COLOR_CYAN}║${COLOR_RESET}\n" \
@@ -708,7 +673,6 @@ show_dashboard() {
         local folder
         for folder in "${SKIPPED_FOLDERS[@]}"; do
             local short="$folder"
-            # Truncate long paths to fit
             (( ${#short} > W - 4 )) && short="...${folder: -(($W - 7))}"
             _drow "  ${COLOR_YELLOW}${short}${COLOR_RESET}"
         done
@@ -716,8 +680,8 @@ show_dashboard() {
 
     _dhdr
     _drow "  ${COLOR_BOLD}SOURCE SAVINGS${COLOR_RESET}"
-    _drow "$(printf '    %-22s %s' 'Original total:'  "$(format_bytes "$total_orig_all")"  )"
-    _drow "$(printf '    %-22s %s' 'Current total:'   "$(format_bytes "$current_source")"  )"
+    _drow "$(printf '    %-22s %s' 'Original total:'  "$(format_bytes "$total_orig")"     )"
+    _drow "$(printf '    %-22s %s' 'Current total:'   "$(format_bytes "$current_source")" )"
     _drow "$(printf '    %-22s %s%s (%s%%)%s' 'Saved:' \
         "$COLOR_GREEN" "$(format_bytes "$savings")" "$savings_pct" "$COLOR_RESET")"
 
@@ -729,43 +693,67 @@ show_dashboard() {
 
     printf "${COLOR_BOLD}${COLOR_CYAN}╚%s╝${COLOR_RESET}\n" "$sep" >&2
     echo >&2
+
+    # ── Email report (plain text) ───────────────────────────────────────────
+    if [[ -n "${EMAIL:-}" ]]; then
+        local plain_report
+        plain_report=$(cat <<EOFREPORT
+SHORTPIXEL ANALYTICS DASHBOARD
+Run date : $(date '+%Y-%m-%d %H:%M:%S')
+Directory: ${INPUT_DIR:-N/A}
+=======================================================
+
+FILE SUMMARY
+  Processed (success): ${s}
+  Failed/Error:        ${e}
+  Skipped (.splog):    ${sk}
+  Excluded (ext):      ${ex}
+
+SOURCE SAVINGS
+  Original total : $(format_bytes "$total_orig")
+  Current total  : $(format_bytes "$current_source")
+  Saved          : $(format_bytes "$savings") (${savings_pct}%)
+
+TOTAL SYSTEM FOOTPRINT
+  Current source : $(format_bytes "$current_source")
+  Backup folder  : $(format_bytes "$backup_size")
+  Total          : $(format_bytes "$total_footprint")
+EOFREPORT
+)
+        send_email_report "ShortPixel Run Report — $(date '+%Y-%m-%d %H:%M')" "$plain_report"
+    fi
 }
 
 # ==============================================================================
-# SECTION 12: RESTORE
+# SECTION 14: RESTORE
 # ==============================================================================
 
 do_restore() {
-    log_info "Restoring from backup: $BACKUP_DIR → $INPUT_DIR"
-
+    log_info "Restoring: $BACKUP_DIR → $INPUT_DIR"
     if [[ ! -d "$BACKUP_DIR" ]]; then
         log_error "Backup directory not found: $BACKUP_DIR"
         exit 2
     fi
 
     local audit_log="${SCRIPT_DIR}/restore_audit.log"
-    : > "$audit_log"   # Overwrite (create empty)
-
+    : > "$audit_log"
     local restored=0 failed=0
 
-    while IFS= read -r -d '' backup_file; do
-        local rel_path="${backup_file#${BACKUP_DIR}/}"
-        local source_file="${INPUT_DIR}/${rel_path}"
-
-        mkdir -p "$(dirname "$source_file")"
-
-        if cp "$backup_file" "$source_file"; then
-            echo "$source_file" >> "$audit_log"
-            log_success "Restored: $rel_path"
-            restored=$(( restored + 1 ))
+    while IFS= read -r -d '' bfile; do
+        local rel="${bfile#${BACKUP_DIR}/}"
+        local src="${INPUT_DIR}/${rel}"
+        mkdir -p "$(dirname "$src")"
+        if cp "$bfile" "$src"; then
+            echo "$src"          >> "$audit_log"
+            log_success "Restored: $rel"
+            (( restored++ )) || true
         else
-            log_error "Failed to restore: $rel_path"
-            echo "FAILED: $source_file" >> "$audit_log"
-            failed=$(( failed + 1 ))
+            echo "FAILED: $src"  >> "$audit_log"
+            log_error "Failed to restore: $rel"
+            (( failed++ )) || true
         fi
     done < <(find "$BACKUP_DIR" -type f ! -name ".splog" -print0 2>/dev/null)
 
-    # Delete all .splog files after successful restore
     log_info "Removing .splog files from source tree..."
     find "$INPUT_DIR" -name ".splog" -delete 2>/dev/null || true
 
@@ -774,160 +762,365 @@ do_restore() {
 }
 
 # ==============================================================================
-# SECTION 13: PURGE BACKUPS
+# SECTION 15: PURGE BACKUPS
 # ==============================================================================
 
 do_purge_backups() {
     local days="$1"
     log_info "Purging backup files older than ${days} days (only if in .splog)..."
-
     if [[ ! -d "$BACKUP_DIR" ]]; then
         log_warn "Backup directory not found: $BACKUP_DIR"
         return 0
     fi
 
     local purged=0 kept=0
+    while IFS= read -r -d '' bfile; do
+        local rel="${bfile#${BACKUP_DIR}/}"
+        local fname; fname=$(basename "$rel")
+        local rdir;  rdir=$(dirname  "$rel")
+        local sdir
+        [[ "$rdir" == "." ]] && sdir="$INPUT_DIR" || sdir="${INPUT_DIR}/${rdir}"
 
-    while IFS= read -r -d '' backup_file; do
-        local rel_path="${backup_file#${BACKUP_DIR}/}"
-        local filename
-        filename=$(basename "$rel_path")
-        local rel_dir
-        rel_dir=$(dirname "$rel_path")
-
-        local source_dir
-        if [[ "$rel_dir" == "." ]]; then
-            source_dir="$INPUT_DIR"
+        if splog_has_entry "$sdir" "$fname"; then
+            log_info "Purging: $rel"
+            rm -f "$bfile"
+            (( purged++ )) || true
         else
-            source_dir="${INPUT_DIR}/${rel_dir}"
-        fi
-
-        if splog_has_entry "$source_dir" "$filename"; then
-            log_info "Purging: $rel_path"
-            rm -f "$backup_file"
-            purged=$(( purged + 1 ))
-        else
-            log_info "Keeping (no .splog entry): $rel_path"
-            kept=$(( kept + 1 ))
+            log_info "Keeping (no .splog entry): $rel"
+            (( kept++ )) || true
         fi
     done < <(find "$BACKUP_DIR" -type f ! -name ".splog" -mtime +"${days}" -print0 2>/dev/null)
 
-    # Remove empty backup directories
     find "$BACKUP_DIR" -type d -empty -delete 2>/dev/null || true
-
     log_success "Purge complete: ${purged} deleted, ${kept} kept"
 }
 
 # ==============================================================================
-# SECTION 14: ARGUMENT PARSING
+# SECTION 16: ONBOARDING WIZARD
+# (runs only when .env is missing AND a TTY is attached)
 # ==============================================================================
 
+run_wizard() {
+    # Helper: prompt with a default value; returns user input or the default
+    # Usage: _ask "Prompt text" "default_value" -> sets _wiz_ans
+    _ask() {
+        local prompt="$1" default="$2"
+        if [[ -n "$default" ]]; then
+            printf "${COLOR_BOLD}%s${COLOR_RESET} [%s]: " "$prompt" "$default" >&2
+        else
+            printf "${COLOR_BOLD}%s${COLOR_RESET}: " "$prompt" >&2
+        fi
+        read -r _wiz_ans || { echo >&2; exit 1; }
+        _wiz_ans="${_wiz_ans# }"; _wiz_ans="${_wiz_ans% }"
+        if [[ -z "$_wiz_ans" ]]; then _wiz_ans="$default"; fi
+    }
+    # Helper: yes/no prompt; returns 0 for yes, 1 for no
+    # Usage: _ask_yn "Prompt" "Y"  (second arg is the default: Y or N)
+    _ask_yn() {
+        local prompt="$1" default="${2:-Y}" hint
+        if [[ "$default" == "Y" ]]; then hint="Y/n"; else hint="y/N"; fi
+        printf "${COLOR_BOLD}%s${COLOR_RESET} [%s]: " "$prompt" "$hint" >&2
+        read -r _wiz_yn || { echo >&2; exit 1; }
+        _wiz_yn="${_wiz_yn# }"; _wiz_yn="${_wiz_yn% }"
+        if [[ -z "$_wiz_yn" ]]; then _wiz_yn="$default"; fi
+        [[ "${_wiz_yn,,}" == "y" ]]
+    }
+
+    echo >&2
+    printf "${COLOR_BOLD}${COLOR_CYAN}╔══════════════════════════════════════════════╗${COLOR_RESET}\n" >&2
+    printf "${COLOR_BOLD}${COLOR_CYAN}║   ShortPixel Optimizer — First-Run Setup     ║${COLOR_RESET}\n" >&2
+    printf "${COLOR_BOLD}${COLOR_CYAN}╚══════════════════════════════════════════════╝${COLOR_RESET}\n" >&2
+    echo >&2
+    log_info "No .env found. Let's create one in: ${SCRIPT_DIR}/"
+    log_info "Press Enter to accept the default shown in [brackets]. Ctrl+C to abort."
+    echo >&2
+
+    # ── API Key (required) ──────────────────────────────────────────────────
+    printf "${COLOR_BOLD}${COLOR_YELLOW}── REQUIRED ──────────────────────────────────${COLOR_RESET}\n" >&2
+    local wiz_key=""
+    while [[ -z "$wiz_key" ]]; do
+        _ask "ShortPixel API key  (get one at shortpixel.com/api-key)" ""
+        wiz_key="$_wiz_ans"
+        if [[ -z "$wiz_key" ]]; then log_warn "API key cannot be empty."; fi
+    done
+    echo >&2
+
+    # ── Compression ─────────────────────────────────────────────────────────
+    printf "${COLOR_BOLD}${COLOR_CYAN}── COMPRESSION ───────────────────────────────${COLOR_RESET}\n" >&2
+    log_info "Lossy mode: 0=lossless, 1=lossy, 2=glossy"
+    _ask "Default compression mode" "1"; local wiz_lossy="$_wiz_ans"
+    [[ "$wiz_lossy" =~ ^[012]$ ]] || { log_warn "Invalid value; using 1 (lossy)."; wiz_lossy=1; }
+
+    _ask_yn "Keep EXIF metadata" "N" && local wiz_keep_exif=1 || local wiz_keep_exif=0
+    echo >&2
+
+    # ── Processing ──────────────────────────────────────────────────────────
+    printf "${COLOR_BOLD}${COLOR_CYAN}── PROCESSING ────────────────────────────────${COLOR_RESET}\n" >&2
+    _ask "Parallel workers" "4";           local wiz_concurrency="$_wiz_ans"
+    [[ "$wiz_concurrency" =~ ^[1-9][0-9]*$ ]] || { log_warn "Invalid; using 4."; wiz_concurrency=4; }
+
+    _ask "API wait seconds (1-30)" "25";   local wiz_wait="$_wiz_ans"
+    [[ "$wiz_wait" =~ ^[0-9]+$ ]] && (( wiz_wait >= 1 && wiz_wait <= 30 )) \
+        || { log_warn "Invalid; using 25."; wiz_wait=25; }
+    echo >&2
+
+    # ── Output ──────────────────────────────────────────────────────────────
+    printf "${COLOR_BOLD}${COLOR_CYAN}── OUTPUT ────────────────────────────────────${COLOR_RESET}\n" >&2
+    local wiz_overwrite=false wiz_output_dir=""
+    if _ask_yn "Overwrite original files with optimized versions" "N"; then
+        wiz_overwrite=true
+        log_info "Originals will be replaced in-place (backup is still taken first)."
+    else
+        _ask "Save optimized files to a custom directory (Enter to use <source>/optimized/)" ""
+        wiz_output_dir="$_wiz_ans"
+        if [[ -n "$wiz_output_dir" ]]; then
+            log_info "Optimized files will go to: $wiz_output_dir"
+        else
+            log_info "Optimized files will go to <source_dir>/optimized/ (default)."
+        fi
+    fi
+
+    _ask "Extensions to exclude, comma-separated, case-sensitive (e.g. JPG,PNG)" ""
+    local wiz_exclude="$_wiz_ans"
+    echo >&2
+
+    # ── Backup ──────────────────────────────────────────────────────────────
+    printf "${COLOR_BOLD}${COLOR_CYAN}── BACKUP ────────────────────────────────────${COLOR_RESET}\n" >&2
+    local wiz_backup="" wiz_backup_enabled=false
+    if _ask_yn "Enable backups (originals mirrored before any change)" "Y"; then
+        wiz_backup_enabled=true
+        _ask "Backup directory" "${SCRIPT_DIR}/backups"
+        wiz_backup="$_wiz_ans"
+    else
+        log_info "Backups disabled. Originals will not be mirrored."
+    fi
+    echo >&2
+
+    # ── Email ───────────────────────────────────────────────────────────────
+    printf "${COLOR_BOLD}${COLOR_CYAN}── EMAIL REPORTS ─────────────────────────────${COLOR_RESET}\n" >&2
+    _ask "Email address for run reports (Enter to skip)" ""; local wiz_email="$_wiz_ans"
+
+    local wiz_mail_cmd=""
+    if [[ -n "$wiz_email" ]]; then
+        wiz_mail_cmd=$(_detect_mail_cmd)
+        if [[ -n "$wiz_mail_cmd" ]]; then
+            log_success "Mail command detected: ${wiz_mail_cmd}"
+            if _ask_yn "Send a test email to ${wiz_email} now" "N"; then
+                local test_body="ShortPixel Optimizer — test email. Setup is working!"
+                if [[ "$wiz_mail_cmd" == "mail" ]]; then
+                    printf '%s' "$test_body" | mail -s "ShortPixel Test" "$wiz_email" 2>/dev/null \
+                        && log_success "Test email sent to $wiz_email." \
+                        || log_warn "Test email may have failed — check mail logs."
+                else
+                    { printf 'To: %s\nSubject: ShortPixel Test\n\n%s' "$wiz_email" "$test_body"; } \
+                        | sendmail -t 2>/dev/null \
+                        && log_success "Test email sent to $wiz_email." \
+                        || log_warn "Test email may have failed — check mail logs."
+                fi
+            fi
+        else
+            log_warn "No mail/sendmail found. Email reports will be disabled."
+            log_warn "Install mailutils (Debian/Ubuntu) or mailx (RHEL/macOS) to enable."
+            wiz_email=""
+        fi
+    fi
+    echo >&2
+
+    # ── Write .env ──────────────────────────────────────────────────────────
+    local env_file="${SCRIPT_DIR}/.env"
+    {
+        cat <<EOF
+# ShortPixel Optimizer — Configuration
+# Generated by setup wizard on $(date '+%Y-%m-%d %H:%M:%S')
+# Edit this file at any time; CLI flags always take precedence.
+#
+# Get your API key at: https://shortpixel.com/api-key
+
+# ── Required ───────────────────────────────────────────────────────────────
+
+# Your ShortPixel API key
+API_KEY=${wiz_key}
+
+# ── Compression ────────────────────────────────────────────────────────────
+
+# Lossy mode: 0=lossless, 1=lossy, 2=glossy
+LOSSY=${wiz_lossy}
+
+# Keep EXIF metadata: 0=strip (default), 1=keep
+KEEP_EXIF=${wiz_keep_exif}
+
+# ── Processing ─────────────────────────────────────────────────────────────
+
+# Parallel workers
+CONCURRENCY=${wiz_concurrency}
+
+# API wait seconds (1-30)
+API_WAIT=${wiz_wait}
+
+# ── Output ─────────────────────────────────────────────────────────────────
+
+# Overwrite originals in-place (true/false). Backup is always taken first.
+OVERWRITE=${wiz_overwrite}
+
+# Save optimized files to a fixed directory (leave empty for <source>/optimized/)
+# Ignored when OVERWRITE=true
+EOF
+        if [[ -n "$wiz_output_dir" ]]; then
+            echo "OUTPUT_DIR=${wiz_output_dir}"
+        else
+            echo "# OUTPUT_DIR="
+        fi
+        cat <<EOF
+
+# Comma-separated extensions to exclude (case-sensitive). Example: JPG,PNG
+EOF
+        if [[ -n "$wiz_exclude" ]]; then
+            echo "EXCLUDE_EXT=${wiz_exclude}"
+        else
+            echo "# EXCLUDE_EXT="
+        fi
+        cat <<EOF
+
+# ── Backup ─────────────────────────────────────────────────────────────────
+
+# Set to the backup mirror directory, or leave empty to disable backups
+EOF
+        if [[ "$wiz_backup_enabled" == "true" ]]; then
+            echo "BACKUP_DIR=${wiz_backup}"
+        else
+            echo "# BACKUP_DIR="
+        fi
+        cat <<EOF
+
+# ── Email Reports ──────────────────────────────────────────────────────────
+
+# Email address for analytics reports after each run (leave empty to disable)
+EMAIL=${wiz_email}
+
+# Mail command: "mail" or "sendmail" (leave empty to auto-detect)
+MAIL_CMD=${wiz_mail_cmd}
+EOF
+    } > "$env_file"
+
+    echo >&2
+    log_success ".env created: $env_file"
+    log_info "You can re-run the wizard at any time by deleting .env."
+    echo >&2
+}
+
+# ==============================================================================
+# SECTION 17: LOAD .env  +  ARGUMENT PARSING
+# (configuration hierarchy: defaults → .env → CLI flags)
+# ==============================================================================
+
+# Run wizard if .env is absent
+if [[ ! -f "${SCRIPT_DIR}/.env" ]]; then
+    if [[ "$IS_INTERACTIVE" == "true" ]]; then
+        run_wizard
+    else
+        log_warn "No .env file found and running non-interactively. Use -k/--key to supply API_KEY."
+    fi
+fi
+
+# Load .env (overrides defaults set in Section 1)
+if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "${SCRIPT_DIR}/.env"
+    set +a
+fi
+
+# Preserve .env values with fallback to defaults
+API_KEY="${API_KEY:-}"
+EMAIL="${EMAIL:-}"
+MAIL_CMD="${MAIL_CMD:-}"
+BACKUP_DIR="${BACKUP_DIR:-${SCRIPT_DIR}/backups}"
+EXCLUDE_EXT="${EXCLUDE_EXT:-}"
+
+# CLI argument parsing  (overrides .env values)
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -h|--help)
-            show_help; exit 0 ;;
+        -h|--help)           show_help; exit 0 ;;
 
-        -k|--key)       API_KEY="$2";       shift 2 ;;
-        --key=*)        API_KEY="${1#*=}";   shift   ;;
+        -k|--key)            API_KEY="$2";          shift 2 ;;
+        --key=*)             API_KEY="${1#*=}";      shift   ;;
 
-        -o|--output-dir) OUTPUT_DIR="$2";   shift 2 ;;
-        --output-dir=*)  OUTPUT_DIR="${1#*=}"; shift ;;
+        -o|--output-dir)     OUTPUT_DIR="$2";        shift 2 ;;
+        --output-dir=*)      OUTPUT_DIR="${1#*=}";   shift   ;;
 
-        --overwrite)    OVERWRITE=true;      shift   ;;
-        --force)        FORCE=true;          shift   ;;
-
-        --restore)      DO_RESTORE=true;     shift   ;;
+        --overwrite)         OVERWRITE=true;         shift   ;;
+        --force)             FORCE=true;             shift   ;;
+        --restore)           DO_RESTORE=true;        shift   ;;
 
         --purge-backups)
             DO_PURGE=true
-            if [[ "${2:-}" =~ ^[0-9]+$ ]]; then
-                PURGE_DAYS="$2"; shift 2
-            else
-                shift
-            fi ;;
-        --purge-backups=*)
-            DO_PURGE=true; PURGE_DAYS="${1#*=}"; shift ;;
+            [[ "${2:-}" =~ ^[0-9]+$ ]] && { PURGE_DAYS="$2"; shift 2; } || shift ;;
+        --purge-backups=*)   DO_PURGE=true; PURGE_DAYS="${1#*=}"; shift ;;
 
-        --backup-dir)   BACKUP_DIR="$2";     shift 2 ;;
-        --backup-dir=*) BACKUP_DIR="${1#*=}"; shift  ;;
+        --backup-dir)        BACKUP_DIR="$2";        shift 2 ;;
+        --backup-dir=*)      BACKUP_DIR="${1#*=}";   shift   ;;
 
-        -j|--concurrency)   CONCURRENCY="$2";       shift 2 ;;
-        --concurrency=*)    CONCURRENCY="${1#*=}";   shift   ;;
-        -w|--wait)          API_WAIT="$2";           shift 2 ;;
-        --wait=*)           API_WAIT="${1#*=}";      shift   ;;
+        -j|--concurrency)    CONCURRENCY="$2";       shift 2 ;;
+        --concurrency=*)     CONCURRENCY="${1#*=}";  shift   ;;
 
-        -l|--lossy)     LOSSY="$2";          shift 2 ;;
-        --lossy=*)      LOSSY="${1#*=}";     shift   ;;
-        --keep-exif)    KEEP_EXIF=1;         shift   ;;
-        --no-cmyk2rgb)  CMYK2RGB=0;          shift   ;;
+        -w|--wait)           API_WAIT="$2";          shift 2 ;;
+        --wait=*)            API_WAIT="${1#*=}";     shift   ;;
 
-        --resize)       RESIZE="$2";         shift 2 ;;
-        --resize=*)     RESIZE="${1#*=}";    shift   ;;
-        --resize-width) RESIZE_WIDTH="$2";   shift 2 ;;
-        --resize-width=*) RESIZE_WIDTH="${1#*=}"; shift ;;
-        --resize-height) RESIZE_HEIGHT="$2"; shift 2 ;;
-        --resize-height=*) RESIZE_HEIGHT="${1#*=}"; shift ;;
+        -l|--lossy)          LOSSY="$2";             shift 2 ;;
+        --lossy=*)           LOSSY="${1#*=}";        shift   ;;
+        --keep-exif)         KEEP_EXIF=1;            shift   ;;
+        --no-cmyk2rgb)       CMYK2RGB=0;             shift   ;;
 
-        --convertto)    CONVERTTO="$2";      shift 2 ;;
-        --convertto=*)  CONVERTTO="${1#*=}"; shift   ;;
-        --upscale)      UPSCALE="$2";        shift 2 ;;
-        --upscale=*)    UPSCALE="${1#*=}";   shift   ;;
+        --resize)            RESIZE="$2";            shift 2 ;;
+        --resize=*)          RESIZE="${1#*=}";       shift   ;;
+        --resize-width)      RESIZE_WIDTH="$2";      shift 2 ;;
+        --resize-width=*)    RESIZE_WIDTH="${1#*=}"; shift   ;;
+        --resize-height)     RESIZE_HEIGHT="$2";     shift 2 ;;
+        --resize-height=*)   RESIZE_HEIGHT="${1#*=}";shift   ;;
 
-        --bg-remove)    BG_REMOVE=1;         shift   ;;
+        --convertto)         CONVERTTO="$2";         shift 2 ;;
+        --convertto=*)       CONVERTTO="${1#*=}";    shift   ;;
+        --upscale)           UPSCALE="$2";           shift 2 ;;
+        --upscale=*)         UPSCALE="${1#*=}";      shift   ;;
 
-        --)             shift; break ;;
+        --bg-remove)         BG_REMOVE=1;            shift   ;;
+
+        --)                  shift; break ;;
         -*)
             log_error "Unknown option: $1"
             echo "Run with --help for usage." >&2
             exit 3 ;;
         *)
-            if [[ -z "$INPUT_DIR" ]]; then
-                INPUT_DIR="$1"
-            else
-                log_error "Unexpected argument: $1"
-                exit 3
+            if [[ -z "$INPUT_DIR" ]]; then INPUT_DIR="$1"
+            else log_error "Unexpected argument: $1"; exit 3
             fi
             shift ;;
     esac
 done
 
-# Default input directory: current working directory
-if [[ -z "$INPUT_DIR" ]]; then
-    INPUT_DIR="$PWD"
-fi
-INPUT_DIR="$(cd "$INPUT_DIR" && pwd)"   # Resolve to absolute path
+[[ -z "$INPUT_DIR" ]] && INPUT_DIR="$PWD"
+INPUT_DIR="$(cd "$INPUT_DIR" && pwd)"
 BACKUP_DIR="$(mkdir -p "$BACKUP_DIR" 2>/dev/null; cd "$BACKUP_DIR" && pwd)" || true
 
 # ==============================================================================
-# SECTION 15: DEPENDENCY CHECKS
+# SECTION 18: DEPENDENCY CHECK  (curl only)
 # ==============================================================================
 
 if ! command -v curl &>/dev/null; then
-    log_error "curl is required but not installed."
+    log_error "curl is required but not found. Please install curl."
     exit 3
 fi
 
-if ! command -v jq &>/dev/null; then
-    log_warn "jq not found. Attempting auto-install via apt..."
-    if command -v apt-get &>/dev/null && sudo apt-get install -y jq &>/dev/null; then
-        log_success "jq installed successfully."
-    else
-        log_error "Could not install jq. Please install it manually."
-        log_error "  Ubuntu/Debian: sudo apt install jq"
-        log_error "  macOS:         brew install jq"
-        exit 3
-    fi
-fi
-
 # ==============================================================================
-# SECTION 16: RESTORE / PURGE MODES (bypass normal optimization flow)
+# SECTION 19: RESTORE / PURGE DISPATCH
 # ==============================================================================
 
 if [[ "$DO_RESTORE" == "true" ]]; then
     if [[ "$IS_INTERACTIVE" == "true" ]]; then
-        printf '%s' "Restore all backups from '$BACKUP_DIR' to '$INPUT_DIR'? This overwrites current files. [y/N] " >&2
-        read -r _ans
-        if [[ ! "$_ans" =~ ^[Yy]$ ]]; then
+        printf "Restore all backups from '%s' to '%s'? This overwrites current files. [y/N] " \
+            "$BACKUP_DIR" "$INPUT_DIR" >&2
+        read -r _ans || true
+        if [[ ! "${_ans:-}" =~ ^[Yy]$ ]]; then
             log_info "Restore cancelled."
             exit 0
         fi
@@ -942,99 +1135,42 @@ if [[ "$DO_PURGE" == "true" ]]; then
 fi
 
 # ==============================================================================
-# SECTION 17: VALIDATION (optimization mode)
+# SECTION 20: VALIDATION
 # ==============================================================================
 
-if [[ -z "$API_KEY" ]]; then
-    log_error "API key is required. Use --key or set API_KEY in .env"
-    exit 3
-fi
+[[ -z "$API_KEY" ]] && { log_error "API key is required. Use -k/--key or set API_KEY in .env"; exit 3; }
+[[ -d "$INPUT_DIR" ]] || { log_error "Input directory does not exist: $INPUT_DIR"; exit 3; }
+[[ -r "$INPUT_DIR" ]] || { log_error "Input directory is not readable: $INPUT_DIR"; exit 2; }
 
-if [[ ! -d "$INPUT_DIR" ]]; then
-    log_error "Input directory does not exist: $INPUT_DIR"
-    exit 3
-fi
+[[ "$LOSSY"       =~ ^[012]$          ]] || { log_error "--lossy must be 0, 1, or 2 (got: $LOSSY)";           exit 3; }
+[[ "$RESIZE"      =~ ^(0|1|3|4)$      ]] || { log_error "--resize must be 0, 1, 3, or 4 (got: $RESIZE)";     exit 3; }
+[[ "$CONCURRENCY" =~ ^[1-9][0-9]*$    ]] || { log_error "--concurrency must be a positive integer";           exit 3; }
+[[ "$API_WAIT"    =~ ^[0-9]+$         ]] && (( API_WAIT >= 1 && API_WAIT <= 30 )) \
+                                         || { log_error "--wait must be 1-30 (got: $API_WAIT)";               exit 3; }
 
-if [[ ! -r "$INPUT_DIR" ]]; then
-    log_error "Input directory is not readable: $INPUT_DIR"
-    exit 2
-fi
-
-if ! [[ "$LOSSY" =~ ^[012]$ ]]; then
-    log_error "--lossy must be 0, 1, or 2. Got: $LOSSY"
-    exit 3
-fi
-
-if ! [[ "$API_WAIT" =~ ^[0-9]+$ ]] || (( API_WAIT < 1 || API_WAIT > 30 )); then
-    log_error "--wait must be 1-30. Got: $API_WAIT"
-    exit 3
-fi
-
-if ! [[ "$CONCURRENCY" =~ ^[0-9]+$ ]] || (( CONCURRENCY < 1 )); then
-    log_error "--concurrency must be a positive integer. Got: $CONCURRENCY"
-    exit 3
-fi
-
-if ! [[ "$RESIZE" =~ ^(0|1|3|4)$ ]]; then
-    log_error "--resize must be 0, 1, 3, or 4. Got: $RESIZE"
-    exit 3
-fi
-
-if [[ -n "$RESIZE_WIDTH"  ]] && ! [[ "$RESIZE_WIDTH"  =~ ^[0-9]+$ && "$RESIZE_WIDTH"  -gt 0 ]]; then
-    log_error "--resize-width must be a positive integer."
-    exit 3
-fi
-
-if [[ -n "$RESIZE_HEIGHT" ]] && ! [[ "$RESIZE_HEIGHT" =~ ^[0-9]+$ && "$RESIZE_HEIGHT" -gt 0 ]]; then
-    log_error "--resize-height must be a positive integer."
-    exit 3
-fi
-
-if [[ -n "$CONVERTTO" ]] && ! [[ "$CONVERTTO" =~ ^\+(webp|avif|webp\+avif)$ ]]; then
-    log_error "--convertto must be +webp, +avif, or +webp+avif. Got: $CONVERTTO"
-    exit 3
-fi
-
-if [[ -n "$UPSCALE" ]] && ! [[ "$UPSCALE" =~ ^[234]$ ]]; then
-    log_error "--upscale must be 2, 3, or 4. Got: $UPSCALE"
-    exit 3
-fi
+[[ -n "$RESIZE_WIDTH"  ]] && { [[ "$RESIZE_WIDTH"  =~ ^[1-9][0-9]*$ ]] || { log_error "--resize-width must be a positive integer";  exit 3; }; }
+[[ -n "$RESIZE_HEIGHT" ]] && { [[ "$RESIZE_HEIGHT" =~ ^[1-9][0-9]*$ ]] || { log_error "--resize-height must be a positive integer"; exit 3; }; }
+[[ -n "$CONVERTTO"     ]] && { [[ "$CONVERTTO"     =~ ^\+(webp|avif|webp\+avif)$ ]] || { log_error "--convertto must be +webp, +avif, or +webp+avif"; exit 3; }; }
+[[ -n "$UPSCALE"       ]] && { [[ "$UPSCALE"       =~ ^[234]$        ]] || { log_error "--upscale must be 2, 3, or 4";              exit 3; }; }
 
 if [[ "$OVERWRITE" == "true" && -n "$OUTPUT_DIR" ]]; then
-    log_error "--overwrite and --output-dir cannot be used together."
+    log_error "--overwrite and --output-dir are mutually exclusive."
     exit 3
 fi
 
-# Resolve output directory (only needed when --output-dir is explicitly set)
 if [[ "$OVERWRITE" != "true" && -n "$OUTPUT_DIR" ]]; then
-    if ! mkdir -p "$OUTPUT_DIR" 2>/dev/null; then
-        log_error "Cannot create output directory: $OUTPUT_DIR"
-        exit 2
-    fi
-    if [[ ! -w "$OUTPUT_DIR" ]]; then
-        log_error "Output directory is not writable: $OUTPUT_DIR"
-        exit 2
-    fi
+    mkdir -p "$OUTPUT_DIR" 2>/dev/null || { log_error "Cannot create output dir: $OUTPUT_DIR"; exit 2; }
+    [[ -w "$OUTPUT_DIR" ]] || { log_error "Output dir is not writable: $OUTPUT_DIR"; exit 2; }
 fi
 
-if ! mkdir -p "$BACKUP_DIR" 2>/dev/null; then
-    log_error "Cannot create backup directory: $BACKUP_DIR"
-    exit 2
-fi
-
-if [[ ! -w "$BACKUP_DIR" ]]; then
-    log_error "Backup directory is not writable: $BACKUP_DIR"
-    exit 2
-fi
+mkdir -p "$BACKUP_DIR" 2>/dev/null || { log_error "Cannot create backup dir: $BACKUP_DIR"; exit 2; }
+[[ -w "$BACKUP_DIR" ]]             || { log_error "Backup dir is not writable: $BACKUP_DIR"; exit 2; }
 
 # ==============================================================================
-# SECTION 18: MAIN — orchestrates discovery and parallel processing
+# SECTION 21: MAIN — orchestrates discovery and parallel processing
 # ==============================================================================
 
 main() {
-    # --------------------------------------------------------------------------
-    # Global exit handler: always show dashboard, always clean up temp files
-    # --------------------------------------------------------------------------
     _cleanup() {
         local _ec=$?
         show_dashboard
@@ -1046,43 +1182,27 @@ main() {
     trap '_cleanup' EXIT
     trap 'log_warn "Interrupted. Waiting for active workers..."; wait; exit 130' INT TERM
 
-    # --------------------------------------------------------------------------
-    # Initialise temp directory for counters and lock files
-    # --------------------------------------------------------------------------
     PROGRESS_DIR=$(mktemp -d)
-    touch "$PROGRESS_DIR/success" \
-          "$PROGRESS_DIR/error" \
-          "$PROGRESS_DIR/skipped" \
-          "$PROGRESS_DIR/excluded" \
-          "$PROGRESS_DIR/orig_bytes" \
-          "$PROGRESS_DIR/opt_bytes" \
-          "$PROGRESS_DIR/all_orig_bytes" \
-          "$PROGRESS_DIR/excl_sizes" \
-          "$PROGRESS_DIR/skip_sizes"
+    touch "$PROGRESS_DIR/success" "$PROGRESS_DIR/error" "$PROGRESS_DIR/skipped" \
+          "$PROGRESS_DIR/excluded" "$PROGRESS_DIR/orig_bytes" "$PROGRESS_DIR/opt_bytes" \
+          "$PROGRESS_DIR/all_orig_bytes" "$PROGRESS_DIR/excl_sizes" "$PROGRESS_DIR/skip_sizes"
 
     DASHBOARD_ENABLED=true
 
-    # Export everything workers (background subshells) need
     export API_ENDPOINT API_KEY LOSSY API_WAIT RESIZE RESIZE_WIDTH RESIZE_HEIGHT
     export CONVERTTO KEEP_EXIF CMYK2RGB BG_REMOVE UPSCALE
     export CONCURRENCY MAX_POLL_RETRIES POLL_SLEEP_SECONDS
-    export INPUT_DIR OUTPUT_DIR OVERWRITE BACKUP_DIR FORCE
+    export INPUT_DIR OUTPUT_DIR OVERWRITE BACKUP_DIR FORCE EMAIL MAIL_CMD
     export TOTAL_FILES PROGRESS_DIR DASHBOARD_ENABLED
     export COLOR_RED COLOR_GREEN COLOR_YELLOW COLOR_BLUE COLOR_CYAN COLOR_RESET COLOR_BOLD
 
-    # --------------------------------------------------------------------------
-    # File discovery (recursive).
-    # Exclude: backup dir (if nested under INPUT_DIR), explicit OUTPUT_DIR (if set),
-    # and any "optimized/" subdirectories (the per-folder default output location).
-    # --------------------------------------------------------------------------
+    # ── File discovery ──────────────────────────────────────────────────────
     local -a find_prune=()
-    if [[ "$BACKUP_DIR" == "${INPUT_DIR}"/* || "$BACKUP_DIR" == "$INPUT_DIR" ]]; then
-        find_prune+=(-path "$BACKUP_DIR" -prune -o)
-    fi
-    if [[ -n "${OUTPUT_DIR:-}" && ( "$OUTPUT_DIR" == "${INPUT_DIR}"/* || "$OUTPUT_DIR" == "$INPUT_DIR" ) ]]; then
-        find_prune+=(-path "$OUTPUT_DIR" -prune -o)
-    fi
-    # Always exclude "optimized/" subdirs (per-folder default output)
+    [[ "$BACKUP_DIR" == "${INPUT_DIR}"/* || "$BACKUP_DIR" == "$INPUT_DIR" ]] \
+        && find_prune+=(-path "$BACKUP_DIR" -prune -o)
+    [[ -n "${OUTPUT_DIR:-}" ]] && \
+        [[ "$OUTPUT_DIR" == "${INPUT_DIR}"/* || "$OUTPUT_DIR" == "$INPUT_DIR" ]] \
+        && find_prune+=(-path "$OUTPUT_DIR" -prune -o)
     find_prune+=(-name "optimized" -type d -prune -o)
 
     local -a FILES=()
@@ -1091,10 +1211,8 @@ main() {
     done < <(find "$INPUT_DIR" \
         "${find_prune[@]}" \
         -type f \( \
-            -iname "*.jpg"  -o \
-            -iname "*.jpeg" -o \
-            -iname "*.png"  -o \
-            -iname "*.gif"  -o \
+            -iname "*.jpg"  -o -iname "*.jpeg" -o \
+            -iname "*.png"  -o -iname "*.gif"  -o \
             -iname "*.webp" \
         \) -print0 | sort -z)
 
@@ -1107,59 +1225,44 @@ main() {
         return 0
     fi
 
-    # --------------------------------------------------------------------------
-    # Print run summary
-    # --------------------------------------------------------------------------
+    # ── Run summary ─────────────────────────────────────────────────────────
     local comp_label
-    case "$LOSSY" in
-        0) comp_label="lossless" ;;
-        1) comp_label="lossy"    ;;
-        2) comp_label="glossy"   ;;
-    esac
+    case "$LOSSY" in 0) comp_label="lossless";; 1) comp_label="lossy";; 2) comp_label="glossy";; esac
 
     echo >&2
-    log_info "ShortPixel Batch Optimizer v2.0"
+    log_info "ShortPixel Batch Optimizer v3.0 (zero-dependency)"
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     log_info "Input folder    : $INPUT_DIR"
-    if [[ "$OVERWRITE" == "true" ]]; then
-        log_info "Output mode     : Overwrite originals"
-    elif [[ -n "$OUTPUT_DIR" ]]; then
-        log_info "Output folder   : $OUTPUT_DIR"
-    else
-        log_info "Output mode     : <source_dir>/optimized/ (per folder)"
+    if   [[ "$OVERWRITE" == "true" ]]; then log_info "Output mode     : Overwrite originals"
+    elif [[ -n "$OUTPUT_DIR"       ]]; then log_info "Output folder   : $OUTPUT_DIR"
+    else                                    log_info "Output mode     : <source_dir>/optimized/ (per folder)"
     fi
     log_info "Backup dir      : $BACKUP_DIR"
     log_info "Images found    : $TOTAL_FILES (recursive)"
     log_info "Compression     : $comp_label (mode=$LOSSY)"
     log_info "Workers         : $CONCURRENCY parallel"
-    [[ -n "$EXCLUDE_EXT"    ]] && log_info "Excluded exts   : $EXCLUDE_EXT (case-sensitive)"
-    [[ "$FORCE" == "true"   ]] && log_warn "Force mode      : ON (ignoring .splog entries)"
+    [[ -n "$EXCLUDE_EXT" ]] && log_info "Excluded exts   : $EXCLUDE_EXT (case-sensitive)"
+    [[ -n "$EMAIL"        ]] && log_info "Report email    : $EMAIL"
+    [[ "$FORCE" == "true" ]] && log_warn "Force mode      : ON (ignoring .splog entries)"
     [[ "$IS_INTERACTIVE" == "false" ]] && log_info "Mode            : non-interactive (CRON)"
     log_info "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo >&2
 
-    # --------------------------------------------------------------------------
-    # FIFO semaphore — N tokens for N concurrent workers
-    # --------------------------------------------------------------------------
+    # ── FIFO semaphore ───────────────────────────────────────────────────────
     SEMAPHORE=$(mktemp -u)
     mkfifo "$SEMAPHORE"
     exec 3<>"$SEMAPHORE"
-    local i
-    for i in $(seq 1 "$CONCURRENCY"); do echo >&3; done
+    local i; for i in $(seq 1 "$CONCURRENCY"); do echo >&3; done
 
-    # --------------------------------------------------------------------------
-    # Main processing loop
-    # --------------------------------------------------------------------------
+    # ── Main processing loop ─────────────────────────────────────────────────
     local current_dir=""
     for input_file in "${FILES[@]}"; do
         local file_dir filename fsize
-        file_dir="$(dirname "$input_file")"
+        file_dir="$(dirname  "$input_file")"
         filename="$(basename "$input_file")"
 
-        # --- Per-directory one-time setup ---
         if [[ "$file_dir" != "$current_dir" ]]; then
             current_dir="$file_dir"
-
             if [[ -z "${DIR_CHECKED[$file_dir]+x}" ]]; then
                 if [[ -w "$file_dir" ]]; then
                     DIR_CHECKED[$file_dir]=1
@@ -1172,7 +1275,6 @@ main() {
             fi
         fi
 
-        # --- Skip files in non-writable directories ---
         if [[ "${DIR_CHECKED[$file_dir]}" == "0" ]]; then
             fsize=$(get_file_size "$input_file")
             printf '%020d\n' "$fsize" >> "$PROGRESS_DIR/skip_sizes"
@@ -1181,7 +1283,6 @@ main() {
             continue
         fi
 
-        # --- Skip excluded extensions ---
         if is_excluded "$input_file"; then
             log_info "Excluded: $filename"
             fsize=$(get_file_size "$input_file")
@@ -1191,7 +1292,6 @@ main() {
             continue
         fi
 
-        # --- Skip already-processed files unless --force ---
         if [[ "$FORCE" != "true" ]] && splog_has_entry "$file_dir" "$filename"; then
             log_info "Already optimized (skip): $filename"
             fsize=$(get_file_size "$input_file")
@@ -1201,16 +1301,13 @@ main() {
             continue
         fi
 
-        # --- Record original size for analytics (before dispatching to worker) ---
         fsize=$(get_file_size "$input_file")
         printf '%020d\n' "$fsize" >> "$PROGRESS_DIR/all_orig_bytes"
 
-        # --- Block until a worker slot is available, then launch ---
         read -u 3
         process_file "$input_file" &
     done
 
-    # Wait for all background workers to finish
     wait
 }
 

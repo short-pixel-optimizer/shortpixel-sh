@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-`shortpixel-optimize.sh` v2.0 — a production-ready bash script that batch-optimizes images using the [ShortPixel API](https://shortpixel.com/api-docs#post). It uploads local files via multipart POST, polls for results, downloads optimized versions, maintains per-folder `.splog` state files, mirrors originals to a backup directory, and displays an analytics dashboard on exit.
+`shortpixel-optimize.sh` v3.0 — a zero-dependency, production-ready bash script that batch-optimizes images using the [ShortPixel API](https://shortpixel.com/api-docs#post). It uploads local files via multipart POST, polls for results, downloads optimized versions, maintains per-folder `.splog` state files, mirrors originals to a backup directory, displays an analytics dashboard on exit, and optionally emails the report.
+
+**No extra dependencies** — requires only `bash 4+` and `curl`. JSON parsing is handled with `grep`, `sed`, and `awk` (all standard Unix tools).
 
 ## Running the script
 
@@ -31,37 +33,78 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ./shortpixel-optimize.sh --help
 ```
 
-**Dependencies:** `curl`, `jq` (auto-installed via `apt` if missing)
+**Dependencies:** `curl` only (uses `grep`/`sed`/`awk` for JSON — no `jq`)
 
-**Configuration:** Create a `.env` file in the script's directory:
+**First run:** If `.env` is missing and a TTY is attached, an interactive onboarding wizard runs automatically and creates `.env`. In non-interactive/CRON mode the wizard is skipped and a warning is printed.
+
+**Configuration:** `.env` file in the script's directory (created by wizard or manually):
 ```
 API_KEY=your_key_here
-BACKUP_DIR=/path/to/backups          # optional, default: <script_dir>/backups
-EXCLUDE_EXT=JPG,PNG                  # optional, case-sensitive
+EMAIL=you@example.com            # optional — analytics report sent after each run
+MAIL_CMD=mail                    # optional — auto-detected if empty (mail or sendmail)
+BACKUP_DIR=/path/to/backups      # optional, default: <script_dir>/backups
+OVERWRITE=false                  # optional, default: false
+OUTPUT_DIR=/path/to/output       # optional — ignored when OVERWRITE=true
+EXCLUDE_EXT=JPG,PNG              # optional, case-sensitive
+LOSSY=1                          # optional, default: 1  (0=lossless, 1=lossy, 2=glossy)
+KEEP_EXIF=0                      # optional, default: 0  (1=keep)
+CONCURRENCY=4                    # optional, default: 4
+API_WAIT=25                      # optional, default: 25 (seconds, 1-30)
 ```
+
+**Configuration hierarchy:** CLI flags > `.env` file > internal script defaults.
 
 ## Architecture
 
-The script is structured in 18 clearly labelled sections inside a single file:
+The script is structured in 21 clearly labelled sections inside a single file:
 
-1. **Configuration + .env loading** — loads `.env` from script dir, sets UPPERCASE globals
+1. **Configuration defaults** — UPPERCASE globals with hardcoded defaults
 2. **Terminal colors** — TTY-conditional ANSI colors
 3. **Logging helpers** — `log_info/success/warn/error()`, all write to stderr
 4. **Help** — `show_help()` extracts the header comment block from the script itself
 5. **File utilities** — `get_file_size()`, `get_file_extension()`, `get_md5()`, `format_bytes()`
-6. **Exclusion check** — `is_excluded()`: case-sensitive extension match against `EXCLUDE_EXT`
-7. **`.splog` management** — `splog_prune()`, `splog_has_entry()`, `splog_write_entry()`
-8. **Backup management** — `get_backup_path()`, `backup_file()`, `verify_backup()`
-9. **Progress tracking** — `increment_counter()` (atomic O_APPEND), `show_progress()`
-10. **API interaction** — `download_file()`, `parse_api_response()`, `optimize_single_file()`, `process_file()`
-11. **Analytics Dashboard** — `show_dashboard()`: file counts, space savings (MB/GB), skipped folders
-12. **Restore** — `do_restore()`: copies backup mirror → source, writes `restore_audit.log`
-13. **Purge** — `do_purge_backups()`: age + `.splog` gated backup deletion
-14. **Argument parsing** — manual `while/case` loop (supports `-k VAL` and `--key=VAL` forms)
-15. **Dependency checks** — curl required; jq auto-installed via apt if missing
-16. **Restore / Purge dispatch** — early exit for `--restore` and `--purge-backups` modes
-17. **Validation** — range checks, mutex flag checks, output/backup dir setup
-18. **Main** — file discovery, per-dir `.splog` pruning, FIFO semaphore, parallel dispatch
+6. **JSON parsing** — `_json_first()`, `_json_status_code/message()`, `_json_str()`, `_json_num()` — no jq
+7. **Exclusion check** — `is_excluded()`: case-sensitive extension match against `EXCLUDE_EXT`
+8. **`.splog` management** — `splog_prune()`, `splog_has_entry()`, `splog_write_entry()`
+9. **Backup management** — `get_backup_path()`, `backup_file()`, `verify_backup()`
+10. **Progress tracking** — `increment_counter()` (atomic O_APPEND), `show_progress()`
+11. **Email report** — `_detect_mail_cmd()`, `send_email_report()`: plain-text dashboard via `mail`/`sendmail`
+12. **API interaction** — `download_file()`, `optimize_single_file()`, `process_file()`
+13. **Analytics Dashboard** — `show_dashboard()`: file counts, space savings (MB/GB), skipped folders; triggers email on exit
+14. **Restore** — `do_restore()`: copies backup mirror → source, writes `restore_audit.log`
+15. **Purge** — `do_purge_backups()`: age + `.splog` gated backup deletion
+16. **Onboarding wizard** — `run_wizard()`: interactive first-run setup, creates `.env`
+17. **Load `.env` + argument parsing** — sources `.env`, then `while/case` CLI loop (supports `-k VAL` and `--key=VAL` forms)
+18. **Dependency check** — curl required; exits with code 3 if missing
+19. **Restore / Purge dispatch** — early exit for `--restore` and `--purge-backups` modes
+20. **Validation** — range checks, mutex flag checks, output/backup dir setup
+21. **Main** — file discovery, per-dir `.splog` pruning, FIFO semaphore, parallel dispatch
+
+### Onboarding wizard
+
+Runs automatically on first use (no `.env`) when a TTY is present. Skipped silently in CRON/non-interactive mode. Prompts for:
+
+| Section | Questions |
+|---------|-----------|
+| Required | API key (loops until non-empty) |
+| Compression | Lossy mode `[1]`, keep EXIF `[N]` |
+| Processing | Parallel workers `[4]`, API wait seconds `[25]` |
+| Output | Overwrite originals `[N]`; if no → custom output dir (Enter = default `<source>/optimized/`) |
+| Output | Extensions to exclude |
+| Backup | Enable backups `[Y]`; if yes → backup directory `[<script_dir>/backups]` |
+| Email | Email address (Enter to skip); if given → auto-detects `mail`/`sendmail`, optional test send |
+
+All values default on Enter. Writes a fully commented `.env`. Re-run wizard by deleting `.env`.
+
+### JSON parsing (no jq)
+
+Section 6 provides targeted parsers for the ShortPixel API response format using only `awk`, `grep`, and `sed`:
+
+- `_json_first JSON` — collapses newlines, extracts the first `{...}` object from an array (or passes through plain objects)
+- `_json_status_code OBJ` — extracts `Status.Code` from `"Status":{"Code":"X",...}`
+- `_json_status_message OBJ` — extracts `Status.Message`
+- `_json_str OBJ KEY` — extracts a top-level string field value
+- `_json_num OBJ KEY` — extracts a top-level numeric field value
 
 ### Concurrency model
 
@@ -103,18 +146,18 @@ The backup is verified (exists and size > 0) before the API call. If verificatio
 
 ### Output path
 
-- **Default** (no `--output-dir`): `<source_dir>/optimized/<filename>` — optimized file lands in an `optimized/` subfolder inside the same directory as the source
-- **`--output-dir DIR`**: all optimized files go flat into `DIR/`
-- **`--overwrite`**: replaces the source file in-place (backup is created first)
+- **Default** (no `--output-dir`, `OVERWRITE=false`): `<source_dir>/optimized/<filename>` — optimized file lands in an `optimized/` subfolder inside the same directory as the source
+- **`--output-dir DIR`** / **`OUTPUT_DIR=`** in `.env`: all optimized files go flat into `DIR/`
+- **`--overwrite`** / **`OVERWRITE=true`** in `.env`: replaces the source file in-place (backup is created first)
 
-`optimized/` subdirectories are automatically excluded from recursive file discovery.
+`--overwrite` and `--output-dir` are mutually exclusive. `optimized/` subdirectories are automatically excluded from recursive file discovery.
 
 ### ShortPixel API behaviour
 
 - Endpoint: `POST https://api.shortpixel.com/v2/post-reducer.php` (multipart form)
 - `file_paths` must use a simple key (e.g. `"file1"`) that matches the form field name
 - Files with spaces/special chars in their path must be copied to a temp file first — curl's `-F field=@path` cannot handle spaces in the path portion
-- The API returns a JSON **array** on success, but a plain **object** for global errors; `parse_api_response()` normalizes both to array before parsing
+- The API returns a JSON **array** on success, but a plain **object** for global errors; `_json_first()` normalises both to a single object before parsing
 - `Status.Code` is returned as a **string** (`"1"`, `"2"`, `"-403"`, etc.), not a number
 - Status `"1"` = pending; poll with `file_urls[]=<OriginalURL>` (no binary re-upload)
 - Status `"2"` = complete; download from `LossyURL` or `LosslessURL`
@@ -137,5 +180,7 @@ The Analytics Dashboard is always printed on exit, regardless of exit code.
 Shown on every exit (normal, error, Ctrl-C). Displays:
 - File counts: processed / failed / skipped (`.splog`) / excluded (extension)
 - Skipped folders list (no write permission)
-- Source savings: original total vs current total vs bytes saved (MB/GB)
+- Source savings: original total vs current total vs bytes saved (MB/GB, 2 decimals)
 - Total system footprint: current source + backup folder size
+
+If `EMAIL` is set in `.env`, the dashboard is also sent as plain text email via `mail` or `sendmail` (auto-detected, or set `MAIL_CMD` explicitly).
