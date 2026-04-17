@@ -1,5 +1,5 @@
 
-## Project
+##  ShortPixel Optimizer CLI
 
 `shortpixel-optimize.sh` v3.0 — a zero-dependency, production-ready bash script that batch-optimizes images using the [ShortPixel API](https://shortpixel.com/api-docs#post). It uploads local files via multipart POST, polls for results, downloads optimized versions, maintains per-folder `.splog` state files, mirrors originals to a backup directory, displays an analytics dashboard on exit, and optionally emails the report.
 
